@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+""" #!/usr/bin/env python"""
 
 from __future__ import division, print_function
 
@@ -13,12 +13,11 @@ import os
 import theano
 import theano.tensor as T
 import fuel
-import ipdb
 import time
 import cPickle as pickle
 
 from argparse import ArgumentParser
-from theano import tensor
+from theano import tensor, config
 
 from fuel.streams import DataStream
 from fuel.schemes import SequentialScheme
@@ -27,17 +26,23 @@ from fuel.transformers import Flatten
 from blocks.algorithms import GradientDescent, CompositeRule, StepClipping, RMSProp, Adam
 from blocks.bricks import Tanh, Identity
 from blocks.bricks.cost import BinaryCrossEntropy
-from blocks.bricks.recurrent import SimpleRecurrent, LSTM
-from blocks.initialization import Constant, IsotropicGaussian, Orthogonal 
+from blocks.bricks.recurrent import SimpleRecurrent
+from blocks.initialization import Constant, IsotropicGaussian 
 from blocks.filter import VariableFilter
 from blocks.graph import ComputationGraph
-from blocks.roles import PARAMETER
+from blocks.roles import PARAMETER, WEIGHT
 from blocks.monitoring import aggregation
 from blocks.extensions import FinishAfter, Timing, Printing, ProgressBar
 from blocks.extensions.saveload import Checkpoint
 from blocks.extensions.monitoring import DataStreamMonitoring, TrainingDataMonitoring
+from blocks.extensions.training import SharedVariableModifier
 from blocks.main_loop import MainLoop
 from blocks.model import Model
+
+from extensions import PrintingTo
+from draw.initialization import Orthogonal, NormalizedInitialization
+
+from extensions import ForceL2Norm
 
 try:
     from blocks.extras import Plot
@@ -48,13 +53,16 @@ except ImportError:
 import draw.datasets as datasets
 from draw.draw import *
 from draw.samplecheckpoint import SampleCheckpoint
+from draw.bricks import LSTM, LNLSTM, MLP
 
 sys.setrecursionlimit(100000)
 
 #----------------------------------------------------------------------------
 
 def main(name, dataset, epochs, batch_size, learning_rate, attention, 
-            n_iter, enc_dim, dec_dim, z_dim, oldmodel, live_plotting):
+         n_iter, enc_dim, dec_dim, z_dim, oldmodel, live_plotting,
+         initial_rec_gamma, initial_c_gamma, layer_norm, scale, init,
+         force_norm, lr_decay, weight_norm):
 
     image_size, channels, data_train, data_valid, data_test = datasets.get_data(dataset)
 
@@ -68,16 +76,28 @@ def main(name, dataset, epochs, batch_size, learning_rate, attention,
     img_height, img_width = image_size
     x_dim = channels * img_height * img_width
 
-    rnninits = {
-        #'weights_init': Orthogonal(),
-        'weights_init': IsotropicGaussian(0.01),
-        'biases_init': Constant(0.),
-    }
-    inits = {
-        #'weights_init': Orthogonal(),
-        'weights_init': IsotropicGaussian(0.01),
-        'biases_init': Constant(0.),
-    }
+    if init == 'baseline':
+        rnninits = {
+            'weights_init': IsotropicGaussian(0.01),
+            'biases_init': Constant(0.),
+        }
+        inits = {
+            'weights_init': NormalizedInitialization(),
+            'biases_init': Constant(0.),
+        }
+    elif init == 'ortho':
+        rnninits = {
+            'weights_init': Orthogonal(scale),
+            #'weights_init': IsotropicGaussian(0.01),
+            'biases_init': Constant(0.),
+        }
+        inits = {
+            'weights_init': Orthogonal(scale),
+            #'weights_init': IsotropicGaussian(0.01),
+            'biases_init': Constant(0.),
+        }
+    else:
+        raise NotImplementedError
 
     # Configure attention mechanism
     if attention != "":
@@ -121,7 +141,7 @@ def main(name, dataset, epochs, batch_size, learning_rate, attention,
 
     lr_str = lr_tag(learning_rate)
 
-    subdir = name + "-" + time.strftime("%Y%m%d-%H%M%S");
+    subdir = '/Tmp/laurent/draw/paper/' + name + "-" + time.strftime("%Y%m%d");
     longname = "%s-%s-t%d-enc%d-dec%d-z%d-lr%s" % (dataset, attention_tag, n_iter, enc_dim, dec_dim, z_dim, lr_str)
     pickle_file = subdir + "/" + longname + ".pkl"
 
@@ -140,10 +160,25 @@ def main(name, dataset, epochs, batch_size, learning_rate, attention,
 
     #----------------------------------------------------------------------
 
-    encoder_rnn = LSTM(dim=enc_dim, name="RNN_enc", **rnninits)
-    decoder_rnn = LSTM(dim=dec_dim, name="RNN_dec", **rnninits)
-    encoder_mlp = MLP([Identity()], [(read_dim+dec_dim), 4*enc_dim], name="MLP_enc", **inits)
-    decoder_mlp = MLP([Identity()], [             z_dim, 4*dec_dim], name="MLP_dec", **inits)
+    if not layer_norm and not weight_norm:
+        encoder_rnn = LSTM(dim=enc_dim, name="RNN_enc", initial_h_gamma=initial_rec_gamma,
+                           initial_c_gamma=initial_c_gamma, compensate=True, **rnninits)
+        decoder_rnn = LSTM(dim=dec_dim, name="RNN_dec", initial_h_gamma=initial_rec_gamma,
+                           initial_c_gamma=initial_c_gamma, compensate=True, **rnninits)
+    elif not layer_norm and weight_norm:
+        encoder_rnn = LSTM(dim=enc_dim, name="RNN_enc", initial_h_gamma=initial_rec_gamma,
+                           initial_c_gamma=None, compensate=False, **rnninits)
+        decoder_rnn = LSTM(dim=dec_dim, name="RNN_dec", initial_h_gamma=initial_rec_gamma,
+                           initial_c_gamma=None, compensate=False, **rnninits)
+    else:
+        encoder_rnn = LNLSTM(dim=enc_dim, name="RNN_enc",
+                             initial_c_gamma=initial_c_gamma, **rnninits)
+        decoder_rnn = LNLSTM(dim=dec_dim, name="RNN_dec",
+                             initial_c_gamma=initial_c_gamma, **rnninits)
+    encoder_mlp = MLP([Identity()], [(read_dim+dec_dim), 4*enc_dim],
+                      name="MLP_enc", initial_gamma=initial_rec_gamma, **inits)
+    decoder_mlp = MLP([Identity()], [             z_dim, 4*dec_dim],
+                      name="MLP_dec", initial_gamma=initial_rec_gamma, **inits)
     q_sampler = Qsampler(input_dim=enc_dim, output_dim=z_dim, **inits)
 
     draw = DrawModel(
@@ -219,6 +254,17 @@ def main(name, dataset, epochs, batch_size, learning_rate, attention,
             Plot(name, channels=plot_channels)
         ]
 
+    training_extensions = []
+    
+    def decay(iterations):
+        return np.array(learning_rate * (1. / (1. + lr_decay * iterations))).astype(config.floatX)
+
+    training_extensions.append(SharedVariableModifier(algorithm.step_rule.components[1].learning_rate, decay)) 
+    if force_norm:
+        weights = VariableFilter(roles=[WEIGHT])(cg.variables)
+        print(weights)
+        training_extensions.append(ForceL2Norm(weights))
+
     main_loop = MainLoop(
         model=Model(cost),
         data_stream=train_stream,
@@ -244,7 +290,8 @@ def main(name, dataset, epochs, batch_size, learning_rate, attention,
             Checkpoint("{}/{}".format(subdir,name), save_main_loop=False, before_training=True, after_epoch=True, save_separately=['log', 'model']),
             SampleCheckpoint(image_size=image_size[0], channels=channels, save_subdir=subdir, before_training=True, after_epoch=True),
             ProgressBar(),
-            Printing()] + plotting_extensions)
+            Printing(),
+            PrintingTo(os.path.join(subdir, 'log'))] + plotting_extensions + training_extensions)
 
     if oldmodel is not None:
         print("Initializing parameters with old model %s"%oldmodel)
@@ -271,6 +318,8 @@ if __name__ == "__main__":
                 default=100, help="Size of each mini-batch")
     parser.add_argument("--lr", "--learning-rate", type=float, dest="learning_rate",
                 default=1e-3, help="Learning rate")
+    parser.add_argument("--lr_decay", type=float, default=0.0,
+                help="Lr decay")
     parser.add_argument("--attention", "-a", type=str, default="",
                 help="Use attention mechanism (read_window,write_window)")
     parser.add_argument("--niter", type=int, dest="n_iter",
@@ -283,6 +332,19 @@ if __name__ == "__main__":
                 default=100, help="Z-vector dimension")
     parser.add_argument("--oldmodel", type=str,
                 help="Use a model pkl file created by a previous run as a starting point for all parameters")
+    parser.add_argument("--initial_c_gamma", type=float,
+                default=None, help="Initial value of c_gamma.")
+    parser.add_argument("--initial_rec_gamma", type=float,
+                default=1.0, help="Initial value of a and b gammas.")
+    parser.add_argument("--layer_norm", action='store_true',
+                help="Use layer norm")
+    parser.add_argument("--scale", type=float, default=1.0,
+                help="Scale of init.")
+    parser.add_argument("--init", type=str, default='baseline',
+                help="Type of init.")
+    parser.add_argument("--force_norm", action='store_true',
+                help="Force L2 Norm")
+    parser.add_argument("--weight_norm", action='store_true',
+                help="Use weight normalization instead of norm prop")
     args = parser.parse_args()
-
     main(**vars(args))

@@ -11,11 +11,13 @@ from theano import tensor
 
 from blocks.bricks.base import application, lazy
 from blocks.bricks.recurrent import BaseRecurrent, recurrent
-from blocks.bricks import Random, Initializable, MLP, Linear
+from blocks.bricks import Random, Initializable
 from blocks.bricks import Identity, Tanh, Logistic
 
 from attention import ZoomableAttentionWindow
 from prob_layers import replicate_batch
+
+from bricks import MLP, Linear
 
 #-----------------------------------------------------------------------------
 

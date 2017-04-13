@@ -34,12 +34,14 @@ from blocks.extensions.saveload import SerializeMainLoop
 from blocks.extensions.monitoring import DataStreamMonitoring, TrainingDataMonitoring
 from blocks.main_loop import MainLoop
 
-from blocks.bricks import Tanh, MLP
+from blocks.bricks import Tanh
 from blocks.bricks.cost import BinaryCrossEntropy
-from blocks.bricks.recurrent import SimpleRecurrent, LSTM
+from blocks.bricks.recurrent import SimpleRecurrent
 
 from draw import *
 from attention import ZoomableAttentionWindow
+
+from bricks import LSTM, MLP
 
 fuel.config.floatX = theano.config.floatX
 
